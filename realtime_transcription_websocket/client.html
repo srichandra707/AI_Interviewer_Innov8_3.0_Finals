@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Real-time Transcription</title>
+    <style>
+        body { font-family: sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 2em; }
+        h1 { color: #bb86fc; }
+        #transcript { background-color: #1e1e1e; border-left: 4px solid #03dac6; padding: 1em; min-height: 100px; white-space: pre-wrap; word-wrap: break-word; }
+        #status { font-style: italic; color: #cf6679; }
+    </style>
+</head>
+<body>
+    <h1>Live Transcription Feed</h1>
+    <p id="status">Connecting to server...</p>
+    <div id="transcript"></div>
+
+    <script>
+        const transcriptDiv = document.getElementById('transcript');
+        const statusDiv = document.getElementById('status');
+        const socket = new WebSocket('ws://localhost:8765');
+
+        socket.onopen = function(event) {
+            statusDiv.textContent = '✅ Connected. Waiting for transcription...';
+            statusDiv.style.color = '#03dac6';
+        };
+
+        socket.onmessage = function(event) {
+            transcriptDiv.textContent = event.data;
+        };
+
+        socket.onclose = function(event) {
+            statusDiv.textContent = '❌ Disconnected from server. Please refresh.';
+            statusDiv.style.color = '#cf6679';
+        };
+
+        socket.onerror = function(error) {
+            statusDiv.textContent = '❌ Connection error. Is the Python script running?';
+            status_div.style.color = '#cf6679';
+        };
+    </script>
+</body>
+</html>
