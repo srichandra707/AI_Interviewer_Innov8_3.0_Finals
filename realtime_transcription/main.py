@@ -1,6 +1,9 @@
 import os
 import sys
 import asyncio
+import websockets
+import json
+import uuid
 import sounddevice as sd
 import numpy as np
 from datetime import datetime
@@ -82,12 +85,30 @@ class TranscriptionClient:
                 
         except Exception as e:
             print(f"Error starting transcription: {e}")
-            
+
+    async def connect_agent(self):
+        self.session_id = str(uuid.uuid4())
+        self.agent_ws = await websockets.connect("ws://localhost:8765")
+        # start the session
+        await self.agent_ws.send(json.dumps({
+            "action": "start",
+            "session_id": self.session_id
+        }))
+        print(f"Connected to agent with session_id={self.session_id}")
+
     def on_open(self, _, open_response):
-        """Handle connection open event"""
         print("Connected to Deepgram! Start speaking... (Press Ctrl+C to stop)\n")
         print("-" * 50)
         self.is_running = True
+        # Connect to agent in background
+        asyncio.create_task(self.connect_agent())
+
+
+    # def on_open(self, _, open_response):
+    #     """Handle connection open event"""
+    #     print("Connected to Deepgram! Start speaking... (Press Ctrl+C to stop)\n")
+    #     print("-" * 50)
+    #     self.is_running = True
         
     async def stream_audio(self):
         """Stream audio from microphone to Deepgram"""
@@ -161,25 +182,27 @@ class TranscriptionClient:
         self.save_transcript()
         
     def on_transcript(self, _, result):
-        """Handle transcription results"""
         try:
             sentence = result.channel.alternatives[0].transcript
-            
             if not sentence:
                 return
-                
+
             if result.is_final:
-                # Final transcript - add to full transcript and display
                 full_transcript.append(sentence)
                 print(f"\r✓ {sentence}")
                 print("> ", end="", flush=True)
+
+                # send to agent
+                if hasattr(self, "agent_ws"):
+                    asyncio.create_task(self.agent_ws.send(json.dumps({
+                        "type": "audio",
+                        "text": sentence
+                    })))
             else:
-                # Interim transcript - show as we type
-                # Clear the line and show interim result
                 print(f"\r> {sentence}...", end="", flush=True)
         except Exception as e:
             print(f"\nError processing transcript: {e}")
-            
+           
     def on_error(self, _, error):
         """Handle errors"""
         print(f"\nError: {error}")

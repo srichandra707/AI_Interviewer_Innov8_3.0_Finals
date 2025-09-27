@@ -26,7 +26,6 @@ Js2Py==0.74
 marshmallow==3.26.1
 multidict==6.6.4
 mypy_extensions==1.1.0
-numpy==2.3.3
 packaging==25.0
 pipwin==0.5.2
 propcache==0.3.2
