@@ -1,0 +1,4 @@
+Flask
+docker
+flask-cors
+dos2unix
