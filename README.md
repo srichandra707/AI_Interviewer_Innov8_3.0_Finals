@@ -116,3 +116,6 @@ textwrap3==0.9.2
 pywin32==305
 requests==2.31.0
 pandas==2.1.1
+docker
+flask-cors
+dos2unix
