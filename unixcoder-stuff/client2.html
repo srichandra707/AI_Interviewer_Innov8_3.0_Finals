@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Two Sum Approach Detector Demo</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 1rem;
+      background: #f8f9fa;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    #editor {
+      width: 100%;
+      height: 300px;
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      padding: 12px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+      box-sizing: border-box;
+    }
+    #status {
+      margin-top: 1rem;
+      padding: 1rem;
+      background: #eef;
+      border-radius: 6px;
+    }
+    .label {
+      font-weight: bold;
+      color: #005;
+      font-size: 1.1em;
+    }
+    .confidence {
+      font-weight: bold;
+      color: #007;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.8rem;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 0.5rem;
+      text-align: left;
+    }
+    th {
+      background: #ddd;
+      font-weight: bold;
+    }
+    .score-high { background-color: #d4edda; }
+    .score-medium { background-color: #fff3cd; }
+    .score-low { background-color: #f8d7da; }
+    
+    .examples {
+      margin-top: 2rem;
+      padding: 1rem;
+      background: #e9ecef;
+      border-radius: 6px;
+    }
+    .example-code {
+      background: #f8f9fa;
+      padding: 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+      margin: 0.5rem 0;
+      cursor: pointer;
+      border: 1px solid #dee2e6;
+    }
+    .example-code:hover {
+      background: #e9ecef;
+    }
+    .controls {
+      margin: 1rem 0;
+    }
+    button {
+      padding: 0.5rem 1rem;
+      margin-right: 0.5rem;
+      border: 1px solid #007bff;
+      background: #007bff;
+      color: white;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #0056b3;
+    }
+    .error {
+      color: #dc3545;
+      background: #f8d7da;
+      padding: 0.5rem;
+      border-radius: 4px;
+      margin-top: 0.5rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Two Sum Approach Detector Demo</h1>
+    <p>Type or paste your Two Sum solution below. The client will send debounced snapshots to the FastAPI server and show the detected approach with probability scores.</p>
+
+    <div class="controls">
+      <button onclick="loadExample('hash')">Load Hash Map Example</button>
+      <button onclick="loadExample('brute')">Load Brute Force Example</button>
+      <button onclick="loadExample('pointers')">Load Two Pointers Example</button>
+      <button onclick="clearEditor()">Clear</button>
+    </div>
+
+    <textarea id="editor" placeholder="def two_sum(nums, target):
+    # Your Two Sum solution here...
+    pass"></textarea>
+
+    <div id="status">
+      <div>Top approach: <span class="label" id="label">None</span></div>
+      <div>Confidence Level: <span class="confidence" id="confidence-level">N/A</span></div>
+      <div>Score: <span class="confidence" id="confidence">N/A</span></div>
+      <div id="error-msg" class="error" style="display: none;"></div>
+      
+      <div style="margin-top: 1rem;">Approach Scores:</div>
+      <table id="prob_table">
+        <thead>
+          <tr>
+            <th>Approach</th>
+            <th>Confidence Score</th>
+            <th>Semantic Similarity</th>
+            <th>Structural Score</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="examples">
+      <h3>Example Solutions (click to load):</h3>
+      
+      <div class="example-code" onclick="loadExample('hash')">
+        <strong>Hash Map Approach:</strong><br>
+        def two_sum_hash(nums, target):<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;seen = {}<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;for i, num in enumerate(nums):<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;complement = target - num<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if complement in seen:<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return [seen[complement], i]<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;seen[num] = i<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;return []
+      </div>
+
+      <div class="example-code" onclick="loadExample('brute')">
+        <strong>Brute Force Approach:</strong><br>
+        def two_sum_brute(nums, target):<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;n = len(nums)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;for i in range(n):<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for j in range(i+1, n):<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;if nums[i] + nums[j] == target:<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return [i, j]<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;return []
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const sessionId = "sess-demo";
+    const problemId = "TwoSum"; // Add the missing problem_id
+    let snapshotCounter = 0;
+    let debounceTimer = null;
+
+    const editor = document.getElementById("editor");
+    const labelSpan = document.getElementById("label");
+    const confidenceSpan = document.getElementById("confidence");
+    const confidenceLevelSpan = document.getElementById("confidence-level");
+    const tableBody = document.querySelector("#prob_table tbody");
+    const errorMsg = document.getElementById("error-msg");
+
+    // Example codes
+    const examples = {
+      hash: `def two_sum_hash(nums, target):
+    seen = {}
+    for i, num in enumerate(nums):
+        complement = target - num
+        if complement in seen:
+            return [seen[complement], i]
+        seen[num] = i
+    return []`,
+      
+      brute: `def two_sum_brute(nums, target):
+    n = len(nums)
+    for i in range(n):
+        for j in range(i+1, n):
+            if nums[i] + nums[j] == target:
+                return [i, j]
+    return []`,
+      
+      pointers: `def two_sum_two_pointers(nums, target):
+    nums_idx = sorted((num, i) for i, num in enumerate(nums))
+    left, right = 0, len(nums) - 1
+    while left < right:
+        curr_sum = nums_idx[left][0] + nums_idx[right][0]
+        if curr_sum == target:
+            return sorted([nums_idx[left][1], nums_idx[right][1]])
+        elif curr_sum < target:
+            left += 1
+        else:
+            right -= 1
+    return []`
+    };
+
+    function showError(message) {
+      errorMsg.textContent = message;
+      errorMsg.style.display = 'block';
+    }
+
+    function hideError() {
+      errorMsg.style.display = 'none';
+    }
+
+    function sendSnapshot(code) {
+      if (!code.trim()) {
+        clearResults();
+        return;
+      }
+
+      snapshotCounter++;
+      const payload = {
+        session_id: sessionId,
+        problem_id: problemId, // Include problem_id
+        snapshot_id: "snap" + snapshotCounter,
+        code: code
+      };
+      
+      fetch("http://localhost:8000/api/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      })
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        hideError();
+        fetchLabel();
+      })
+      .catch(err => {
+        console.error("Error posting snapshot:", err);
+        showError("Error posting snapshot: " + err.message);
+      });
+    }
+
+    function fetchLabel() {
+      // Fix the URL to include problem_id
+      fetch(`http://localhost:8000/api/session/${sessionId}/${problemId}/label`)
+        .then(res => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+          }
+          return res.json();
+        })
+        .then(data => {
+          hideError();
+          labelSpan.textContent = data.approach;
+          confidenceSpan.textContent = (data.score * 100).toFixed(1) + "%";
+          confidenceLevelSpan.textContent = data.confidence_level;
+          
+          // Update probability table
+          updateTable(data);
+        })
+        .catch(err => {
+          console.error("Error fetching label:", err);
+          showError("Error fetching results: " + err.message);
+        });
+    }
+
+    function updateTable(data) {
+      tableBody.innerHTML = "";
+      
+      // Get additional scores from the latest snapshot
+      fetch(`http://localhost:8000/api/session/${sessionId}/${problemId}/history?limit=1`)
+        .then(res => res.json())
+        .then(historyData => {
+          const latest = historyData.history[historyData.history.length - 1];
+          const similarities = latest?.similarities || {};
+          const structural = latest?.structural_scores || {};
+          
+          for (const [approach, score] of Object.entries(data.smoothed)) {
+            const tr = document.createElement("tr");
+            
+            // Approach name
+            const td1 = document.createElement("td");
+            td1.textContent = approach;
+            if (approach === data.approach) {
+              td1.style.fontWeight = 'bold';
+              td1.style.color = '#007bff';
+            }
+            
+            // Confidence score
+            const td2 = document.createElement("td");
+            td2.textContent = (score * 100).toFixed(1) + "%";
+            
+            // Color code based on score
+            if (score > 0.7) td2.className = 'score-high';
+            else if (score > 0.4) td2.className = 'score-medium';
+            else td2.className = 'score-low';
+            
+            // Semantic similarity
+            const td3 = document.createElement("td");
+            const simScore = similarities[approach] || 0;
+            td3.textContent = (simScore * 100).toFixed(1) + "%";
+            
+            // Structural score
+            const td4 = document.createElement("td");
+            const structScore = structural[approach] || 0;
+            td4.textContent = (structScore * 100).toFixed(1) + "%";
+            
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            tr.appendChild(td4);
+            tableBody.appendChild(tr);
+          }
+        })
+        .catch(err => {
+          // Fallback if history fails
+          for (const [approach, score] of Object.entries(data.smoothed)) {
+            const tr = document.createElement("tr");
+            const td1 = document.createElement("td");
+            td1.textContent = approach;
+            const td2 = document.createElement("td");
+            td2.textContent = (score * 100).toFixed(1) + "%";
+            const td3 = document.createElement("td");
+            td3.textContent = "N/A";
+            const td4 = document.createElement("td");
+            td4.textContent = "N/A";
+            
+            if (score > 0.7) td2.className = 'score-high';
+            else if (score > 0.4) td2.className = 'score-medium';
+            else td2.className = 'score-low';
+            
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            tr.appendChild(td4);
+            tableBody.appendChild(tr);
+          }
+        });
+    }
+
+    function clearResults() {
+      labelSpan.textContent = "None";
+      confidenceSpan.textContent = "N/A";
+      confidenceLevelSpan.textContent = "N/A";
+      tableBody.innerHTML = "";
+      hideError();
+    }
+
+    function loadExample(type) {
+      if (examples[type]) {
+        editor.value = examples[type];
+        sendSnapshot(editor.value);
+      }
+    }
+
+    function clearEditor() {
+      editor.value = "";
+      clearResults();
+    }
+
+    // Debounced input handler
+    editor.addEventListener("input", () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        sendSnapshot(editor.value);
+      }, 600); // 600ms debounce
+    });
+
+    // Load example on page load
+    window.addEventListener('load', () => {
+      loadExample('hash');
+    });
+  </script>
+</body>
+</html>
