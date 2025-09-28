@@ -1,31 +1,7 @@
-"""
-Agentic AI Interviewer - single-file prototype (updated)
-
-Changes made per your request:
-- Picks a question from an external `questions.json` with equal probability.
-- ALWAYS performs both AST structural similarity AND an LLM semantic check (even when AST parses), then combines them.
-- Replaced the unsafe sandbox implementation with a clear TODO placeholder: you must provide a secure sandbox `execute_in_sandbox` implementation before running untrusted code.
-- Replaced the hardcoded LLM hint stub with real OpenAI API calls using GPT-4.1 family (recommended for coding tasks). See web citations in the chat for rationale.
-- The LLM hint prompt includes: problem + optimal solution + tests (sent once when the problem is chosen), candidate's current code snapshot, the last 1 minute of voice transcript, and failing testcases when relevant.
-
-Security: DO NOT run untrusted candidate code until you implement `execute_in_sandbox` using Docker/microVM/cgroups/seccomp as described in earlier messages.
-
-Requirements:
-- Python 3.10+
-- websockets (pip install websockets)
-- openai (pip install openai)
-
-Environment:
-- Set OPENAI_API_KEY in your environment before running.
-
-Usage:
-- Place your questions.json (the 10 Q-A-Testcases JSON) in the same directory.
-- Run: python agentic_interviewer.py
-
-"""
-
 from __future__ import annotations
-import asyncio
+import google.generativeai as genai
+import os
+import threading
 import websockets
 import json
 import time
@@ -36,26 +12,150 @@ import tempfile
 import shutil
 import os
 from typing import Any, Dict, List, Tuple
-import openai
+import queue
+import asyncio
+import requests
+import google.generativeai as genai
+from dotenv import load_dotenv
 
-# --- Configuration: choose an LLM model suitable for coding tasks ---
-# Based on recent benchmarks and model releases, GPT-4.1 (mini) provides
-# strong coding and instruction-following performance with a reasonable cost/latency tradeoff.
-# See OpenAI release notes and comparisons for rationale.
-MODEL = "gpt-4.1-mini"  # change to "gpt-4.1" if you want the highest quality
-openai.api_key = os.getenv("OPENAI_API_KEY")
+load_dotenv()
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 
-# -------------------- Load questions --------------------
-with open("questions.json", "r", encoding="utf-8") as f:
-    QUESTIONS = json.load(f)
+def gemini_chat_completion(prompt: str, temperature: float = 0.0, max_tokens: int = 512) -> str:
+    # ...existing code...
+    # print(genai.list_models())
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    response = model.generate_content(
+        prompt,
+        generation_config={
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+        }
+    )
+    return response.text.strip()
 
-# Choose a question with equal probability
-def pick_question() -> Dict[str, Any]:
-    return random.choice(QUESTIONS)
+api_url = "http://127.0.0.1:5000"  # Replace with actual URL
 
-# -------------------- AST NORMALIZATION & STRUCTURAL SIMILARITY --------------------
+transcription_queue = queue.Queue()
 
-def normalize_and_rename_ast(src: str) -> str:
+INTERVIEW_DURATION = 300
+
+# Globals for hinting state with a lock
+LAST_HINT_TIME = 0.0
+HINT_LOCK = threading.Lock()
+HINT_ATTEMPTS: Dict[str, int] = {}      # attempts per issue type
+HINT_HISTORY: List[Dict[str, Any]] = []  # list of issued hints
+SIM_HISTORY: List[Tuple[float, float, Dict[str, Any]]] = []  # (ts, score, details)
+
+# Thresholds / config
+IDLE_SECONDS_FOR_HINT = 30
+SIM_IMPROVEMENT_THRESHOLD = 0.01
+MIN_SECONDS_BETWEEN_HINTS = 10  # avoid spamming frontend too fast
+
+SESSION_FILE = "session.txt"             # will contain concatenated iteration logs (user requested)
+AUDIO_TRANSCRIPT_FILE = "audio_transcript.txt"  # file that stores all audio text collected during interview (change if needed)
+FINAL_REPORT_FILE = "final_report.txt"   # LLM's textual report output
+FINAL_REPORT_JSON = "final_report.json"  # structured JSON copy of the report (optional)
+
+# ------------------ Utilities ------------------
+
+def detect_top_issue(behav_details: Dict[str, Any]) -> str:
+    if not behav_details:
+        return "style"
+    statuses = [c.get("status") for c in behav_details.get("cases", [])]
+    if any(s == "syntax_error" for s in statuses):
+        return "syntax"
+    if any(s == "runtime_error" for s in statuses):
+        return "runtime"
+    if any(s == "timeout" for s in statuses):
+        return "tle"
+    if any(s == "wrong" for s in statuses):
+        return "logic"
+    return None
+
+def connect_to_transcription_server():
+    """
+    Connects to a websocket transcription server and pushes messages to transcription_queue.
+    Each message can be a string or a JSON string with timestamp/text.
+    """
+    print("Connecting to transcription server...")
+    uri = "ws://localhost:8766"
+
+    async def run():
+        try:
+            async with websockets.connect(uri) as websocket:
+                print(f"Connected to transcription server at {uri}")
+                async for message in websocket:
+                    # message may be a plain string or JSON string like {"ts":..., "text":"..."}
+                    try:
+                        parsed = json.loads(message)
+                        ts = parsed.get("ts", time.time())
+                        txt = parsed.get("text", parsed.get("transcript", "") or "")
+                        transcription_queue.put((ts, txt))
+                        try:
+                            with open(AUDIO_TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+                                f.write(f"{ts}: {txt}\n")
+                        except Exception as e:
+                            print(f"[audio file append] failed: {e}")
+                    except Exception:
+                        # fallback to raw string with current timestamp
+                        transcription_queue.put((time.time(), str(message)))
+        except Exception as e:
+            print(f"Error connecting to transcription server: {e}")
+
+    # run websocket in blocking way within thread
+    try:
+        asyncio.run(run())
+    except Exception as e:
+        print(f"Transcription connection ended: {e}")
+
+def fetch_snapshot():
+    try:
+        resp = requests.get(f"{api_url}/api/snapshots", timeout=5.0)
+        resp.raise_for_status()
+        snap=resp.json()  # Parse JSON response
+        print(snap)
+        # print(resp.text)
+        return snap
+    except Exception as e:
+        print(f"[analysis] failed to fetch snapshot: {e}")
+        return {}
+
+def collect_recent_transcript(max_items=50):
+    """
+    Read up to max_items most recent transcript segments from transcription_queue.
+    Each queue entry is expected to be (timestamp, text) or raw string.
+    Returns combined text and last timestamp seen (or None).
+    """
+    parts = []
+    last_ts = None
+    temp_items = []
+    # drain queue into temp list up to max_items
+    while not transcription_queue.empty() and len(temp_items) < max_items:
+        try:
+            item = transcription_queue.get_nowait()
+            temp_items.append(item)
+        except queue.Empty:
+            break
+
+    # keep them (we consumed them) — if you want to preserve, you'd need to re-queue
+    # Build parts from parsed items
+    for it in temp_items:
+        if isinstance(it, tuple) and len(it) == 2:
+            ts, txt = it
+            parts.append(txt)
+            last_ts = ts if last_ts is None or ts > last_ts else last_ts
+        else:
+            # raw string
+            parts.append(str(it))
+            last_ts = time.time()
+
+    combined = " ".join(parts[-max_items:])
+    return combined, last_ts
+
+# ------------------ AST / Similarity ------------------
+
+def normalize_and_rename_ast(src):
     tree = ast.parse(src)
 
     class Renamer(ast.NodeTransformer):
@@ -96,14 +196,13 @@ def normalize_and_rename_ast(src: str) -> str:
     ast.fix_missing_locations(tree)
     return ast.dump(tree, include_attributes=False)
 
-
-def structural_similarity(src1: str, src2: str= None, precomputed_ast2: str= None) -> float:
+def structural_similarity(src1, src2, precomputed_ast2=None):
     try:
         a = normalize_and_rename_ast(src1).split()
         b = precomputed_ast2.split() if precomputed_ast2 else normalize_and_rename_ast(src2).split()
-
     except Exception as e:
-        raise
+        # if AST fails, return 0 structural similarity
+        return 0.0
     set_a, set_b = set(a), set(b)
     if not set_a and not set_b:
         return 1.0
@@ -113,100 +212,91 @@ def structural_similarity(src1: str, src2: str= None, precomputed_ast2: str= Non
     uni = len(set_a | set_b)
     return inter / uni
 
-# -------------------- SANDBOX: TODO (must be implemented securely) --------------------
-async def execute_in_sandbox(code: str, func_name: str, args: tuple, timeout_s: float = 1.0) -> Tuple[str, Any]:
-    """
-    TODO: Replace this with your secure sandbox implementation.
-    The function must run candidate code in a secure, isolated environment (Docker container / microVM)
-    with network disabled, filesystem restrictions, CPU/memory limits, and timeouts.
+def llm_semantic_similarity(code, optimal, question):
+    prompt = f"""
+You are an expert code reviewer. Rate How Similar the Candidate's code is to the optimal Solution for the following problem on a scale from 0 (completely different) to 1 (equivalent algorithm/logic)
 
-    Return values (status, payload):
-      - ("ok", result) when function executes and returns result
-      - ("syntax_error", error_str) if code fails to parse
-      - ("runtime_error", error_str) if runtime exception
-      - ("timeout", "__TLE__") on timeout
-      - ("other", message) for other problems
-    """
-    raise NotImplementedError("execute_in_sandbox must be implemented with a secure runner")
+Problem:
+{question}
 
-# -------------------- BEHAVIORAL SIMILARITY (uses sandbox) --------------------
-async def behavioral_score(candidate_src: str, optimal_src: str, tests: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
-    details = {"total": len(tests), "candidate_passed": 0, "cases": []}
+Optimal Solution:
+{optimal}
+
+Candidate Code (may not run):
+{code}
+
+Rules for Evaluation:
+- Consider algorithmic structure, data structures used, and core approach. 
+- Ignore variable names, whitespace, and comments. Return a single number between 0 and 1 (e.g., 0.0, 0.35, 0.9).
+- return a one-line reason. AND NOTHING MORE
+- Provide output as JSON: {{"score": number, "reason": "..."}}
+"""
+    response = gemini_chat_completion(prompt, temperature=0.0, max_tokens=200)
     try:
-        tree = ast.parse(optimal_src)
-        f = next((n for n in tree.body if isinstance(n, ast.FunctionDef)), None)
-        func_name = f.name if f else "_candidate_func"
-    except Exception:
-        func_name = "_candidate_func"
-
-    for t in tests:
-        args = t["input"]
-        expected = t["output"]
-        status_c, payload_c = await execute_in_sandbox(candidate_src, func_name, args, timeout_s=1.0)
-        case = {"args": args, "expected": expected, "candidate_status": status_c, "candidate_payload": payload_c}
-        if status_c == "ok" and payload_c == expected:
-            details["candidate_passed"] += 1
-            case["result"] = payload_c
-            case["status"] = "pass"
-        elif status_c == "ok":
-            case["result"] = payload_c
-            case["status"] = "wrong"
-        else:
-            case["status"] = status_c
-        details["cases"].append(case)
-
-    score = details["candidate_passed"] / max(1, details["total"])
-    return score, details
-
-# -------------------- LLM INTEGRATION (OpenAI GPT-4.1 family) --------------------
-async def openai_chat_completion(prompt: str, temperature: float = 0.0, max_tokens: int = 512) -> str:
-    if openai.api_key is None:
-        raise RuntimeError("OPENAI_API_KEY not set in environment")
-    resp = openai.ChatCompletion.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    # Use the assistant's content
-    return resp.choices[0].message.content.strip()
-
-async def llm_semantic_similarity(candidate_code: str, optimal_code: str, question: Dict[str, Any]) -> float:
-    """Ask LLM to rate semantic similarity 0..1. Returns float.
-    We ask the LLM to ignore variable names/formatting and focus on algorithmic intent.
-    """
-    prompt = textwrap.dedent(f"""
-    You are an expert code reviewer. Rate how similar the CANDIDATE's code is to the OPTIMAL solution
-    for the following problem on a scale from 0 (completely different) to 1 (equivalent algorithm/logic).
-
-    Problem:
-    {question.get('title')}
-
-    Optimal solution:
-    {optimal_code}
-
-    Candidate code (may not run):
-    {candidate_code}
-
-    Consider algorithmic structure, data structures used, and core approach. Ignore variable names,
-    whitespace, and comments. Return a single number between 0 and 1 (e.g., 0.0, 0.35, 0.9).
-    Also return a one-line reason.
-    Provide output as JSON: {{"score": number, "reason": "..."}}
-    """.format(optimal_code=optimal_code, candidate_code=candidate_code))
-
-    out = await openai_chat_completion(prompt, temperature=0.0, max_tokens=200)
-    try:
-        parsed = json.loads(out)
+        parsed = json.loads(response)
         return float(parsed.get('score', 0.0)), parsed.get('reason', '')
     except Exception:
-        # fallback: try to extract a number naively
         import re
-        m = re.search(r"([0-1](?:\.[0-9]+)?)", out)
+        m = re.search(r"([0-1](?:\.[0-9]+)?)", response)
         if m:
-            return float(m.group(1)), out
-        return 0.0, out
+            return float(m.group(1)), response
+        return 0.0, response
 
-# -------------------- LLM HINT PROMPT --------------------
+def combined_similarity(code, optimal, question, tests, alpha=0.2, optimal_ast=None):
+    struct = 0.0
+    try:
+        struct = structural_similarity(code, optimal, precomputed_ast2=optimal_ast)
+    except Exception:
+        struct = 0.0
+
+    semantic, semantic_reason = llm_semantic_similarity(code, optimal, question)
+    w_struct = alpha
+    w_sem = 1 - alpha
+    combined = w_struct * struct + w_sem * semantic
+    details = {
+        "structural": struct,
+        "semantic": semantic,
+        "semantic_reason": semantic_reason,
+        # provide placeholder for behavioural details (testcases) if available
+        "behav_details": {
+            "cases": tests if isinstance(tests, list) else []
+        }
+    }
+    return combined, details
+
+def recompute_similarity(snapshot: Dict[str, Any], optimal: str, tests: List[Dict[str, Any]], question: str):
+    """
+    Given a frontend snapshot (which should include candidate code), compute similarity and return (score, details)
+    Expect snapshot to have e.g. snapshot.get('code') or snapshot.get('latest_code').
+    """
+    code = ""
+    if isinstance(snapshot, dict):
+        code = snapshot.get("code") or snapshot.get("latest_code") or snapshot.get("candidate_code") or ""
+    else:
+        code = str(snapshot)
+
+    try:
+        combined_score, details = combined_similarity(code, optimal, question, tests)
+        return combined_score, details
+    except Exception as e:
+        print(f"[similarity] error computing similarity: {e}")
+        return 0.0, {"structural": 0.0, "semantic": 0.0, "semantic_reason": str(e), "behav_details": {"cases": []}}
+
+def communicate_hints_with_frontend(hints):
+    payload = {"hints": hints}
+    try:
+        response = requests.post(f"{api_url}/api/hints", json=payload, timeout=5.0)
+        if response.status_code == 200:
+            print("Hints sent Successfully", hints)
+            global LAST_HINT_TIME
+            with HINT_LOCK:
+                LAST_HINT_TIME = time.time()
+        else:
+            print(f"Failed to send hints. Status code: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Error sending hints: {e}")
+
+# Prompt template for hint
 HINT_PROMPT_BASE = """
 You are a senior technical interviewer and coach. Provide a concise hint (one or two sentences) at the requested level.
 Levels:
@@ -227,303 +317,407 @@ Candidate code (current snapshot):
 Recent audio transcript (last 1 minute) from candidate:
 {audio}
 
-If there are failing testcases, include them here:
-{failed_cases}
-
 Now produce a hint at level {level} focused on the most pressing issue: {issue}.
 Keep it brief and actionable.
 Return only the hint text (no JSON wrapper).
 """
 
-async def llm_hint(problem: Dict[str, Any], candidate_code: str, audio_last_min: str, issue: str, level: str, failed_cases: List[Dict[str,Any]] = None) -> str:
-    failed_cases = failed_cases or []
-    tests_preview = ''.join([str(t) for t in problem.get('tests', [])[:5]])
+def build_hint(problem_title, optimal_code, tests, candidate_code, audio_last_min, issue, level):
+    tests_preview = json.dumps(tests[:5], default=str)
+    # failed_preview = json.dumps(failed_cases or [], default=str)
     prompt = HINT_PROMPT_BASE.format(
-        title=problem.get('title'),
-        optimal=problem.get('optimal'),
+        title=problem_title,
+        optimal=optimal_code,
         tests=tests_preview,
         candidate=candidate_code,
         audio=audio_last_min,
-        failed_cases=''.join([str(fc) for fc in failed_cases]),
         level=level,
         issue=issue,
     )
-    return await openai_chat_completion(prompt, temperature=0.2, max_tokens=200)
+    return gemini_chat_completion(prompt, temperature=0.2, max_tokens=200)
 
-async def llm_verify_fix(issue: str, prev_hint: str, candidate_code: str, tests_summary: Dict[str, Any]) -> Dict[str, Any]:
+MIN_SECONDS_BETWEEN_HINTS = 10
+SIM_IMPROVEMENT_THRESHOLD = 0.01
+
+HINT_LOCK = threading.Lock()
+SIM_HISTORY: List[Tuple[float, float, Dict[str, Any]]] = []
+HINT_ATTEMPTS: Dict[str, int] = {}
+HINT_HISTORY: List[Dict[str, Any]] = []
+LAST_HINT_TIME: float = 0.0
+
+def hint_analysis(
+    recent_transcript: str,
+    score: float,
+    details: Dict[str, Any],
+    current_time: float,
+    snapshot: Dict[str, Any],
+    optimal_code: str,
+    testcases: List[Dict[str, Any]],
+    question: str
+) -> List[Dict[str, Any]]:
     """
-    Uses the LLM to verify whether a specific issue has been fixed in the candidate's latest code.
-    
-    Parameters:
-    - issue: the issue identifier (e.g., "syntax", "logic")
-    - prev_hint: the hint previously given to the candidate
-    - candidate_code: the latest snapshot of candidate's code
-    - tests_summary: dictionary of test cases and results (can include 'input' and 'expected')
-    
-    Returns:
-    - JSON dict: {"fixed": True/False, "explanation": "..."}
+    Decide whether to generate a hint. Returns a list of hint dict(s) or empty list.
+    Logic:
+    - If similarity improvement low OR no audio transcript -> issue hint.
+    - Enforce minimum 10s between hints.
+    - Track attempts per issue and escalate level: 0->Nudge,1->Guide,>=2->Direction
     """
-    # Prepare a concise test summary string for the LLM
-    tests_str = "\n".join([f"Input: {t['input']}, Expected: {t['output']}" for t in tests_summary.get('cases', [])])
+    now = current_time
 
-    prompt = textwrap.dedent(f"""
-    You are a precise code reviewer. The candidate had an issue: {issue}.
-    Previously suggested hint: {prev_hint}
+    # audio presence check (no timestamps available)
+    audio_empty = (not recent_transcript) or (recent_transcript.strip() == "")
 
-    Candidate's new code:
-    {candidate_code}
+    # similarity improvement check
+    last_improve = 0.0
+    with HINT_LOCK:
+        if len(SIM_HISTORY) >= 2:
+            last = SIM_HISTORY[-1][1]
+            prev = SIM_HISTORY[-2][1]
+            last_improve = last - prev
+    should_due_to_similarity = (last_improve <= SIM_IMPROVEMENT_THRESHOLD)
 
-    Relevant test cases and expected results:
-    {tests_str}
+    # enforce global cooldown
+    global LAST_HINT_TIME
+    with HINT_LOCK:
+        time_since_last_hint = time.time() - LAST_HINT_TIME if LAST_HINT_TIME else float("inf")
+    if time_since_last_hint < MIN_SECONDS_BETWEEN_HINTS:
+        return []
 
-    Determine whether the specific issue has been fixed. Answer in strict JSON: {{"fixed": true/false, "explanation": "..."}}
-    Focus only on the single issue.
-    """)
+    # decide if we should issue a hint
+    if not (audio_empty or should_due_to_similarity):
+        return []
 
-    out = await openai_chat_completion(prompt, temperature=0.0, max_tokens=200)
+    # pick top issue
+    behav = details.get("behav_details") if isinstance(details, dict) else {}
+    top_issue = detect_top_issue(behav)
 
-    try:
-        return json.loads(out)
-    except Exception:
-        # fallback if LLM output is not strict JSON
-        return {"fixed": False, "explanation": out}
-
-# -------------------- COMBINED SIMILARITY EVALUATOR (AST + LLM) --------------------
-async def combined_similarity(candidate_src: str, optimal_src: str, tests: List[Dict[str, Any]], alpha: float = 0.2, beta: float = 0.5, optimal_ast: str = None) -> Tuple[float, Dict[str, Any]]:
-    """Compute combined similarity metric:
-       - struct_score: AST structural similarity (0..1) if AST parses, otherwise 0
-       - semantic_score: LLM judgement (0..1) always computed
-       - behav_score: fraction of tests passed (0..1)
-       combined = alpha*struct + beta*semantic + (1-alpha-beta)*behav
-    """
-    struct = 0.0
-    try:
-        struct = structural_similarity(candidate_src, optimal_src, precomputed_ast2=optimal_ast)
-    except Exception:
-        struct = 0.0
-
-    semantic, sem_reason = await llm_semantic_similarity(candidate_src, optimal_src, {})
-    behav, behav_details = await behavioral_score(candidate_src, optimal_src, tests)
-
-    # combine; ensure weights sum to 1
-    w_struct = alpha
-    w_sem = beta
-    w_behav = 1 - (w_struct + w_sem)
-    combined = w_struct * struct + w_sem * semantic + w_behav * behav
-    details = {"struct": struct, "semantic": semantic, "semantic_reason": sem_reason, "behav": behav, "behav_details": behav_details}
-    return combined, details
-
-# -------------------- ISSUE DETECTION --------------------
-
-def detect_top_issue(behav_details: Dict[str, Any]) -> str:
-    statuses = [c.get("status") for c in behav_details.get("cases", [])]
-    if any(s == "syntax_error" for s in statuses):
-        return "syntax"
-    if any(s == "runtime_error" for s in statuses):
-        return "runtime"
-    if any(s == "timeout" for s in statuses):
-        return "tle"
-    if any(s == "wrong" for s in statuses):
-        return "logic"
-    return "style"
-
-# -------------------- HINT MANAGER --------------------
-
-class HintManager:
-    def __init__(self):
-        self.attempts: Dict[str, int] = {}
-        self.history: List[Dict[str, Any]] = []
-
-    async def maybe_issue_hint(self, session: 'Session') -> Dict[str, Any]:
-        idle = session.time_since_activity()
-        # similarity delta check
-        if len(session.similarity_history) >= 2:
-            last_improve = session.similarity_history[-1][1] - session.similarity_history[-2][1]
-        else:
-            last_improve = 0.0
-
-        if idle < 30 and last_improve > 0.01:
-            return {"issued": False}
-
-        combined, details = session.similarity_history[-1][1], session.similarity_history[-1][2]
-        top_issue = detect_top_issue(details.get('behav_details', {}))
-        attempts = self.attempts.get(top_issue, 0)
-        if attempts>= 1:
-            if attempts >= 3:
-                priority = ["syntax", "runtime", "logic", "tle", "style"]
-                idx = priority.index(top_issue) if top_issue in priority else -1
-                top_issue = priority[(idx + 1) % len(priority)]
-                attempts = self.attempts.get(top_issue, 0)
-            else:
-                prev_hint = next((h for h in reversed(self.history) if h['issue'] == top_issue), "")
-                fix_status = await llm_verify_fix(top_issue, prev_hint, session.latest_code, details.get('behav_details', {}))
-                if fix_status.get('fixed'):
-                    priority = ["syntax", "runtime", "logic", "tle", "style"]
-                    idx = priority.index(top_issue) if top_issue in priority else -1
-                    top_issue = priority[(idx + 1) % len(priority)]
-                    attempts = self.attempts.get(top_issue, 0)
-
-        level = "Nudge" if attempts == 0 else ("Guide" if attempts == 1 else "Direction")
-
-        # prepare audio last 1 minute
-        audio_last_min = session.get_audio_last_minute()
-        # failing cases
-        failed = [c for c in details['behav_details']['cases'] if c['status'] not in ('pass',)] if 'behav_details' in details else []
-        hint_text = await llm_hint(session.question, session.latest_code, audio_last_min, top_issue, level, failed)
-        hint = {"time": time.time(), "issue": top_issue, "level": level, "hint": hint_text}
-        self.history.append(hint)
-        self.attempts[top_issue] = attempts + 1
-        session.record_hint(hint)
-        return {"issued": True, **hint}
-
-# -------------------- SESSION CLASS --------------------
-
-class Session:
-    def __init__(self, session_id: str, question: Dict[str, Any]):
-        self.session_id = session_id
-        self.question = question
-        self.optimal = question['optimal']
-        self.tests = question['tests']
-        self.latest_code = ""
-        self.last_keystroke = time.time()
-        self.last_audio = time.time()
-        self.audio_buffer: List[Tuple[float,str]] = []  # (ts, text)
-        self.similarity_history: List[Tuple[float, float, Dict[str, Any]]] = []
-        self.events: List[Dict[str, Any]] = []
-        self.hint_manager = HintManager()
-        self.hint_history: List[Dict[str,Any]] = []
-    
-        # precompute normalized AST of optimal solution
-        try:
-            self.optimal_ast = normalize_and_rename_ast(self.optimal)
-        except Exception:
-            self.optimal_ast = ""
-
-        # initial similarity
-        loop = asyncio.get_event_loop()
-        combined, details = loop.run_until_complete(combined_similarity("", self.optimal, self.tests, optimal_ast= self.optimal_ast))
-        self.similarity_history.append((time.time(), combined, details))
-
-    def latest_code_snippet(self) -> str:
-        return self.latest_code[:20000]
-
-    def record_event(self, evt: Dict[str, Any]):
-        evt['ts'] = time.time()
-        self.events.append(evt)
-        if evt['type'] == 'keystroke':
-            self.last_keystroke = time.time()
-        if evt['type'] == 'audio':
-            self.last_audio = time.time()
-            self.audio_buffer.append((time.time(), evt.get('text','')))
-        if evt['type'] == 'snapshot':
-            self.latest_code = evt.get('code', self.latest_code)
-
-    def get_audio_last_minute(self) -> str:
-        cutoff = time.time() - 60.0
-        recent = [txt for ts, txt in self.audio_buffer if ts >= cutoff]
-        return "".join(recent[-20:])  # up to last 20 snippets
-
-    def time_since_activity(self) -> float:
-        return time.time() - max(self.last_keystroke, self.last_audio)
-
-    async def recompute_similarity(self):
-        combined, details = await combined_similarity(self.latest_code, self.optimal, self.tests)
-        self.similarity_history.append((time.time(), combined, details))
-        return combined, details
-
-    def record_hint(self, hint: Dict[str, Any]):
-        self.hint_history.append(hint)
-        self.events.append({'type': 'hint', 'time': time.time(), 'hint': hint})
-
-    def to_result(self) -> Dict[str, Any]:
-        return {
-            'session_id': self.session_id,
-            'question_id': self.question.get('id'),
-            'question_title': self.question.get('title'),
-            'events': self.events,
-            'similarity_history': self.similarity_history,
-            'hints': self.hint_history,
-        }
-
-# -------------------- WEBSOCKET SERVER --------------------
-
-SESSIONS: Dict[str, Session] = {}
-
-async def handle_message(msg: Dict[str, Any], session: Session):
-    typ = msg.get('type')
-    if typ == 'keystroke':
-        session.record_event({'type': 'keystroke', 'data': msg.get('data')})
-    elif typ == 'audio':
-        session.record_event({'type': 'audio', 'text': msg.get('text')})
-    elif typ == 'snapshot':
-        session.record_event({'type': 'snapshot', 'code': msg.get('code')})
-        await session.recompute_similarity()
+    # determine hint level
+    with HINT_LOCK:
+        attempts = HINT_ATTEMPTS.get(top_issue, 0)
+    if attempts == 0:
+        level = "Nudge"
+    elif attempts == 1:
+        level = "Guide"
     else:
-        session.record_event({'type': 'unknown', 'raw': msg})
+        level = "Direction"
 
-async def session_monitor_loop(session: Session):
-    try:
-        await asyncio.sleep(5*60)  # initial delay
-        while True:
-            await session.recompute_similarity()
-            hint_res = await session.hint_manager.maybe_issue_hint(session)
-            if hint_res.get('issued'):
-                print(f"Hint issued for session {session.session_id}: {hint_res['hint']}")
-            await asyncio.sleep(50)
-    except asyncio.CancelledError:
-        return
+    # get candidate code
+    candidate_code = snapshot.get("code") or snapshot.get("latest_code") or snapshot.get("candidate_code") or ""
 
-async def websocket_handler(websocket, path):
+    # call LLM to build hint
     try:
-        start_msg = await websocket.recv()
-        parsed = json.loads(start_msg)
+        hint_text = build_hint(
+            question,
+            optimal_code,
+            testcases,
+            candidate_code,
+            recent_transcript or "",
+            top_issue,
+            level
+        )
     except Exception as e:
-        await websocket.send(json.dumps({'error': 'invalid start message'}))
-        return
+        print(f"[hint] failed to produce hint: {e}")
+        hint_text = "I couldn't generate a hint right now. Try making a small change to your approach."
 
-    if parsed.get('action') != 'start' or 'session_id' not in parsed:
-        await websocket.send(json.dumps({'error': 'must send start with session_id'}))
-        return
+    hint = {
+        "time": now,
+        "issue": top_issue,
+        "level": level,
+        "hint": hint_text,
+        "score": score,
+    }
 
-    sid = parsed['session_id']
-    q = pick_question()
-    session = Session(sid, q)
-    SESSIONS[sid] = session
+    # update state
+    with HINT_LOCK:
+        HINT_HISTORY.append(hint)
+        HINT_ATTEMPTS[top_issue] = HINT_ATTEMPTS.get(top_issue, 0) + 1
+        LAST_HINT_TIME = time.time()
 
-    # send chosen question and optimal once
-    await websocket.send(json.dumps({'action': 'question', 'question': q['title'], 'signature': q.get('signature'), 'optimal': q.get('optimal'), 'tests': q.get('tests')}))
+    return [hint]
 
-    monitor_task = asyncio.create_task(session_monitor_loop(session))
+# ------------------ Core loop / orchestration ------------------
 
-    try:
-        async for message in websocket:
+def connect_to_frontend_server(question):
+    print("Starting the core application logic...")
+    optimal_code = "def maxSubArray(nums):\n    max_sum = nums[0]\n    cur_sum = nums[0]\n    for num in nums[1:]:\n        cur_sum = max(num, cur_sum + num)\n        max_sum = max(max_sum, cur_sum)\n    return max_sum"
+    testcases = [
+        {"input": "[-2,1,-3,4,-1,2,1,-5,4]", "output": 6},
+        {"input": "[1]", "output": 1},
+        {"input": "[5,4,-1,7,8]", "output": 23},
+        {"input": "[-1,-2,-3]", "output": -1},
+        {"input": "[2,-1,2,3,4,-5]", "output": 10}
+    ]
+
+    start_time = time.time()
+
+    while time.time() - start_time < INTERVIEW_DURATION:
+        try:
+            snapshot = fetch_snapshot()  # expects dict with code + metadata
+            score, details = recompute_similarity(snapshot, optimal_code, testcases, question)
+
+            # Update SIM_HISTORY
+            with HINT_LOCK:
+                SIM_HISTORY.append((time.time(), score, details))
+                # keep SIM_HISTORY modest size
+                if len(SIM_HISTORY) > 200:
+                    SIM_HISTORY.pop(0)
+
+            recent_transcript, last_audio_ts = collect_recent_transcript(max_items=50)
+
+            # For debugging / session log
             try:
-                msg = json.loads(message)
-            except Exception:
-                await websocket.send(json.dumps({'error': 'invalid json'}))
-                continue
-            await handle_message(msg, session)
-            await websocket.send(json.dumps({'ack': True, 'ts': time.time()}))
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
-        monitor_task.cancel()
-        result = session.to_result()
-        fname = f"session_{sid}.json"
-        with open(fname, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2)
-        print(f"Session {sid} ended. Saved {fname}")
+                with open("session.txt", "a", encoding="utf-8") as f:  # append, not overwrite
+                    f.write(f"--- ITERATION {len(SIM_HISTORY)} ---\n")
+                    f.write(f"timestamp: {time.time()}\n")
+                    f.write(f"score: {score}\n")
+                    f.write(f"details: {json.dumps(details, default=str)}\n")
+                    f.write("recent_transcript:\n")
+                    f.write((recent_transcript or "") + "\n")
+                    if isinstance(snapshot, dict):
+                        f.write("snapshot_keys:\n")
+                        f.write(json.dumps(list(snapshot.keys()), default=str) + "\n")
+                        code = snapshot.get("code") or snapshot.get("latest_code") or snapshot.get("candidate_code") or ""
+                        if code:
+                            f.write("candidate_code_preview:\n")
+                            f.write(code[:2000] + ("\n...TRUNCATED...\n" if len(code) > 2000 else "\n"))
+                    else:
+                        f.write(str(snapshot) + "\n")
+                    f.write("\n")
+            except Exception as e:
+                print(f"[session append] failed: {e}")
 
-# -------------------- RUN SERVER --------------------
+
+            hints = hint_analysis(recent_transcript, score, details, time.time(), snapshot, optimal_code, testcases, question)
+            if hints:
+                communicate_hints_with_frontend(hints)
+
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[main loop] error: {e}")
+
+        # Poll interval
+        time.sleep(5)
+
+    end_time = time.time()
+    # ensure we have the latest snapshot (if you have a real snapshot object, use that)
+    final_snapshot = fetch_snapshot() or (frontend_url.get("snapshot") if isinstance(frontend_url, dict) else {})
+    generate_report(start_time, end_time, SIM_HISTORY, HINT_HISTORY, question, optimal_code, final_snapshot)
+    # End of interview handling (example)
+    frontend_url = {"snapshot": "example_snapshot"}  # Replace with actual frontend URL object/dict
+    snapshot = frontend_url.get('snapshot')
+
+    # At end-of-interview in connect_to_frontend_server, after the loop:
+    print(f"Final report written to {FINAL_REPORT_FILE} and {FINAL_REPORT_JSON}")
+
+    print("Interview finished. Final snapshot:", snapshot)
+
+def initialize_interview():
+    question = """Find the maximum subarray sum in an integer array?"""
+    payload = {"question": question}
+    try:
+        response = requests.post(f"{api_url}/api/question", json=payload, timeout=5.0)
+        if response.status_code == 200:
+            print("Question sent Successfully")
+        else:
+            print(f"Failed to send question. Status code: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending question: {e}")
+    return question
 
 def main():
-    host = 'localhost'
-    port = 8765
-    print(f"Starting WebSocket server on ws://{host}:{port}")
-    start_server = websockets.serve(websocket_handler, host, port)
-    asyncio.get_event_loop().run_until_complete(start_server)
-    asyncio.get_event_loop().run_forever()
+    print("Connecting to transcription server and frontend server in threads...")
 
+    question = initialize_interview()
+    t1 = threading.Thread(target=connect_to_transcription_server, daemon=False)
+    t2 = threading.Thread(target=connect_to_frontend_server, args=(question,), daemon=False)
+
+    t1.start()
+    t2.start()
+
+    # Wait for interview duration then exit (or you can join threads)
+    try:
+        # main thread sleeps while worker threads run
+        time.sleep(INTERVIEW_DURATION + 5)
+        final_snapshot = {}  # or load last snapshot from queue/session
+        # generate_report(time.time() - INTERVIEW_DURATION, time.time(), SIM_HISTORY, HINT_HISTORY, question, optimal_code, final_snapshot)
+    except KeyboardInterrupt:
+        print("Interrupted by user, shutting down...")
+
+
+REPORT_PROMPT_TEMPLATE = """
+You are a strict, forensic technical-interview summarizer. DO NOT ADD ANY FACTS THAT ARE NOT CONTAINED IN THE 'facts' JSON. Use ONLY the facts provided below to produce a report.
+
+Output MUST be valid JSON (no extra text, not even the ```json top of the text) with this exact schema:
+{{
+  "dashboard_metrics": {{ ... }},                 # numeric metrics and short summary strings
+  "human_summary": "...",                         # 3-6 short paragraphs describing the candidate's journey (facts-only)
+  "session_playback": [                           # chronological list of notable events for playback (timestamps as unix seconds)
+     {{ "ts": number, "type": "similarity"|"hint"|"snapshot", "summary": "..." }},
+     ...
+  ],
+  "detailed_evaluation": {{                        # bullet-like structured evaluation
+     "problem_understanding": "...",
+     "algorithms_and_ds": "...",
+     "debugging_and_iteration": "...",
+     "communication": "...",
+     "proactiveness": "..."
+  }},
+  "score_out_of_5": number,
+  "hiring_decision": "hire"|"consider"|"reject",
+  "decision_rationale": "..."                      # concise explanation referencing fields inside dashboard_metrics
+}}
+
+FACTS (use only these fields; do not hallucinate and do not invent extra timestamps or facts):
+{facts_json}
+
+INSTRUCTIONS:
+- Use only the facts above. If something is unknown, say 'unknown' for that field.
+- Keep the 'human_summary' factual, avoid adjectives that don't have evidence.
+- Provide short, explicit references to evidence inside the 'decision_rationale' (e.g., 'final_similarity=0.73, hints_count=3').
+- Make the output machine-parseable JSON exactly matching the schema.
+- Temperature: 0.0. Be concise.
+- GENERATE JSON ONLY AND NOTHING ELSE.
+"""
+
+def compute_metrics(sim_history: List[Tuple[float, float, Dict[str, Any]]], hint_history: List[Dict[str, Any]], start_time: float, end_time: float) -> Dict[str, Any]:
+    """
+    Returns deterministic numeric metrics derived from SIM_HISTORY and HINT_HISTORY.
+    sim_history: list of (ts, score, details)
+    hint_history: list of hints
+    """
+    metrics = {}
+    if not sim_history:
+        metrics.update({
+            "final_similarity": 0.0,
+            "avg_similarity": 0.0,
+            "min_similarity": 0.0,
+            "max_similarity": 0.0,
+            "similarity_delta": 0.0,
+            "measurements": 0
+        })
+    else:
+        scores = [s for (_ts, s, _d) in sim_history]
+        metrics["final_similarity"] = float(scores[-1])
+        metrics["avg_similarity"] = float(sum(scores) / len(scores))
+        metrics["min_similarity"] = float(min(scores))
+        metrics["max_similarity"] = float(max(scores))
+        metrics["similarity_delta"] = float(scores[-1] - scores[0]) if len(scores) >= 2 else 0.0
+        metrics["measurements"] = len(scores)
+
+    metrics["hints_count"] = len(hint_history or [])
+    # hints per top_issue breakdown
+    hints_by_issue = {}
+    for h in (hint_history or []):
+        issue = h.get("issue", "unknown")
+        hints_by_issue[issue] = hints_by_issue.get(issue, 0) + 1
+    metrics["hints_by_issue"] = hints_by_issue
+
+    metrics["duration_seconds"] = float(max(0.0, end_time - start_time))
+    # time to first hint:
+    if hint_history:
+        first_hint_ts = min(h.get("time", float("inf")) for h in hint_history)
+        metrics["time_to_first_hint"] = float(first_hint_ts - start_time) if start_time and first_hint_ts != float("inf") else None
+    else:
+        metrics["time_to_first_hint"] = None
+
+    # simple audio presence metric: fraction of iterations with non-empty transcript
+    non_empty = 0
+    for (_ts, _s, d) in sim_history:
+        behav = d.get("behav_details") if isinstance(d, dict) else {}
+        # can't rely on transcript here; we'll compute audio separately from audio file
+        # keep placeholder
+    return metrics
+
+def compute_score_and_decision(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic mapping to a 0-5 score and hiring decision.
+    - final_similarity heavily weighted
+    - avg_similarity secondary
+    - hint penalty: more hints reduce score
+    Decision thresholds:
+      score >= 4.0 -> 'hire'
+      3.0 <= score < 4.0 -> 'consider'
+      score < 3.0 -> 'reject'
+    """
+    final_sim = max(0.0, min(1.0, float(metrics.get("final_similarity", 0.0))))
+    avg_sim = max(0.0, min(1.0, float(metrics.get("avg_similarity", final_sim))))
+    hints = int(metrics.get("hints_count", 0))
+    # penalty (0..1): each 2 hints -> 0.1 penalty, capped at 0.5
+    hint_penalty = min(0.5, 0.05 * hints)
+    # base combined raw 0..1
+    raw = 0.6 * final_sim + 0.3 * avg_sim + 0.1 * (1.0 - hint_penalty)
+    # Map to 0..5
+    score_05 = round(max(0.0, min(5.0, raw * 5.0)), 2)
+
+    if score_05 >= 4.0:
+        decision = "hire"
+    elif score_05 >= 3.0:
+        decision = "consider"
+    else:
+        decision = "reject"
+
+    rationale = {
+        "weights": {"final_similarity": 0.6, "avg_similarity": 0.3, "hint_penalty_influence": 0.1},
+        "final_sim": final_sim,
+        "avg_sim": avg_sim,
+        "hints": hints,
+        "hint_penalty": hint_penalty,
+        "raw_combined": raw
+    }
+
+    return {"score_out_of_5": score_05, "hiring_decision": decision, "rationale": rationale}
+
+# --- Read audio transcript file safely ---
+def load_audio_transcript(path: str = AUDIO_TRANSCRIPT_FILE) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+    
+def generate_report(start_time: float, end_time: float, sim_history: List[Tuple[float, float, Dict[str, Any]]], hint_history: List[Dict[str, Any]], question: str, optimal_code: str, final_snapshot: Dict[str, Any]):
+    # Build facts blob
+    metrics = compute_metrics(sim_history, hint_history, start_time, end_time)
+    decision = compute_score_and_decision(metrics)
+    audio_text = load_audio_transcript()
+    # minimal final candidate code snapshot:
+    final_code = ""
+    if isinstance(final_snapshot, dict):
+        final_code = final_snapshot.get("code") or final_snapshot.get("latest_code") or final_snapshot.get("candidate_code") or ""
+    facts = {
+        "question": question,
+        "optimal_code": optimal_code,
+        "metrics": metrics,
+        "decision_basis": decision,
+        "sim_history": [
+            {"ts": int(ts), "similarity": float(score), "details": details}
+            for (ts, score, details) in sim_history
+        ],
+        "hint_history": hint_history,
+        "audio_transcript": audio_text,
+        "final_snapshot": {"keys": list(final_snapshot.keys()) if isinstance(final_snapshot, dict) else [], "code_preview": final_code[:500]}
+    }
+
+    prompt = REPORT_PROMPT_TEMPLATE.format(facts_json=json.dumps(facts, default=str))
+
+    # call LLM deterministically
+    try:
+        report_text = gemini_chat_completion(prompt)
+        # write the raw text and JSON
+        with open(FINAL_REPORT_FILE, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        # try to parse JSON and save machine-readable copy
+        try:
+            parsed = json.loads(report_text)
+            with open(FINAL_REPORT_JSON, "w", encoding="utf-8") as f:
+                json.dump(parsed, f, indent=2, default=str)
+        except Exception:
+            # if parsing fails, still keep raw text
+            print("[report] LLM output was not valid JSON; saved raw to final_report.txt")
+    except Exception as e:
+        print(f"[report] failed to generate report: {e}")
+
+      
 if __name__ == '__main__':
     main()
-
